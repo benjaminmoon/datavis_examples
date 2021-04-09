@@ -2,6 +2,9 @@
 title: UK cases of COVID-19
 author: Ben Moon
 email: ben@bcmoon.uk
+output:
+  tufte::tufte_html: default
+keep_md: true
 ---
 
 We use [*renv*](https://rstudio.github.io/renv/ "renv reproducible environments") to maintain environments and package versions.
@@ -10,11 +13,12 @@ We use [*renv*](https://rstudio.github.io/renv/ "renv reproducible environments"
 renv::restore()
 
 library(cowplot)
+library(geogrid)
 library(geojsonio)
 library(gganimate)
 library(ggthemes)
+library(mapproj)
 library(sf)
-library(sugarbag)
 library(tidyverse)
 library(viridis)
 
@@ -34,7 +38,7 @@ covid_data_url <-
   )
 covid_data <-
   read_csv(covid_data_url)
-covid_data
+covid_data$newCasesBySpecimenDate[is.na(covid_data$newCasesBySpecimenDate)] <- 0
 ```
 
 Area Codes have prefix E, N, S or W to indicate the country it's in, and the initial number (10 or 06) I think shows whether it's a county or UTLA. There doesn't seem to be any data recorded in *newAdmissions*.
@@ -48,7 +52,8 @@ utla_geojson_url <-
     "658297aefddf49e49dcd5fbfc647769e_4.geojson"
   )
 utla_sf <-
-  geojson_sf(utla_geojson_url)
+  geojson_sf(utla_geojson_url) %>%
+  st_transform(27700)
 utla_sf
 ```
 
@@ -72,19 +77,14 @@ While the time series data is fine, it's difficult to see all of the different r
 
 ```{r covid_regions, fig.cap = "**New UK COVID-19 cases per region.** The highest peaks later in the series occur in London and the South east in January 2021."}
 covid_data %>%
-  ggplot(
-    aes(
-      x = date,
-      y = newCasesBySpecimenDate
-    )
-  ) +
+  ggplot(aes(x = date, y = newCasesBySpecimenDate)) +
     geom_line() +
     facet_wrap(vars(areaCode)) +
     theme_void() +
     theme(strip.text = element_text(size = 4))
 ```
 
-It'll take a little more looking to sort out the order of the plots: does the areaCode have an order associated with it?
+It'll take a little more looking to sort out the order of the plots: does the *areaCode* have an order associated with it?
 
 We can, however, join these data to the map to see the occurrences of cases on a particular day.
 
@@ -97,70 +97,43 @@ covid_feb_joined <-
 
 The are code is matched between the two data sets as they're joined. Here we plot a map, but also a tesselogram or hexagram that shows each region at equal size but still in approximate location. Doing this uses the *sugarbag* package, which includes a lot of functions to make this easy, but doesn't produce the most meaning full hexagram at the end. I'm not sure whether this is my settings, the package, or the area outlines that is the root cause of this. 
 
-```{r arrange_hexagram, message = FALSE}
-hex_size <- 0.6
-
-utla_centroids <-
-  utla_sf %>%
-  create_centroids(sf_id = "ctyua17cd")
-utla_grid <-
-  utla_centroids %>%
-  create_grid(
-    hex_size = hex_size,
-    buffer_dist = 12
-  )
-utla_hex_allo <-
-  allocate(
-    utla_centroids,
-    hex_grid = utla_grid,
-    sf_id = "ctyua17cd",
-    hex_size = hex_size,
-    hex_filter = 20,
-    width = 30,
+```{r geogrid, message = FALSE, warning = FALSE, cache = TRUE}
+utla_hex <-
+  calculate_grid(
+    shape = utla_sf,
+    grid_type = "hexagon",
+    seed = 6,
     verbose = TRUE
-  )
-utla_hexes <-
-  utla_hex_allo %>%
-    fortify_hexagon(
-      hex_size = hex_size,
-      sf_id = "ctyua17cd"
-    ) %>%
-    left_join(
-      covid_data %>%
-        filter(date == "2021-04-01"),
-      by = c("ctyua17cd" = "areaCode")
-    ) %>%
-    mutate(
-      poly_type = "hex",
-      group = ctyua17cd
-    )
+  ) %>%
+  assign_polygons(utla_sf, .)
+hexagram_data <-
+  utla_hex %>%
+  right_join(
+    covid_data %>%
+      filter(date == "2021-02-01"),
+    by = c("ctyua17cd" = "areaCode")
+  ) %>%
+  mutate(group = ctyua17cd)
 ```
 
 I've stuck a lot of the workings into this following function.
 
 ```{r map_plotting_funcs}
 plot_map_figure <-
-  function(
-    shape_data,
-    hexagon_data,
-    fill_variable = "newCasesBySpecimenDate"
-  ) {
+  function(shape_data, hexagon_data, fill_variable = "newCasesBySpecimenDate") {
   # Plot a figure of Local Authority data with both a choropleth map and tesselated hexagram.
   choropleth_map <-
     shape_data %>%
-      ggplot() +
-        geom_sf(
-          aes_(fill = as.name(fill_variable)),
-          lwd = 0.2
-        ) +
+      ggplot(aes_(fill = as.name(fill_variable))) +
+        geom_sf(lwd = 0.2) +
+        coord_sf() +
         theme_map() +
         scale_fill_viridis(discrete = FALSE)
   choropleth_hexagram <-
     hexagon_data %>%
     ggplot(aes_(fill = as.name(fill_variable))) +
-      geom_polygon(
-        aes(x = long, y = lat, group = group)
-      ) +
+      geom_sf(lwd = 0.2) +
+      coord_sf() +
       theme_map() +
       scale_fill_viridis(discrete = FALSE)
   legend <-
@@ -175,8 +148,7 @@ plot_map_figure <-
         theme(legend.position = "none"),
       choropleth_hexagram +
         theme(legend.position = "none"),
-      labels = "AUTO",
-      rel_widths = c(1.5, 2)
+      labels = "AUTO"
     )
   plot_grid(maps, legend, rel_widths = c(3, 0.6))
 }
@@ -184,12 +156,7 @@ plot_map_figure <-
 cp_title <-
   function(title) {
   ggdraw() +
-    draw_label(
-      title,
-      fontface = "bold",
-      x = 0,
-      hjust = 0
-    ) +
+    draw_label(title, fontface = "bold", x = 0, hjust = 0) +
     theme(
       # add margin on the left of the drawing canvas,
       # so title is aligned with left edge of first plot
@@ -204,7 +171,7 @@ So that all the tricky plotting can be hidden away in this function.
 map_w_legend <-
   plot_map_figure(
     shape_data = covid_feb_joined,
-    hexagon_data = utla_hexes,
+    hexagon_data = hexagram_data,
     fill_variable = "newCasesBySpecimenDate"
   )
 
@@ -219,13 +186,6 @@ plot_grid(
   ncol = 1,
   rel_heights = c(0.1, 1)
 )
-# save_plot(
-#   "map_figure.pdf",
-#   figure,
-#   base_height = 120,
-#   base_asp = 1.618,
-#   units = "mm"
-# )
 ```
 
 It's also useful to plot the changes over time, here compared to the week before. We'll use this as it will show longer term trends, but also because that will help account for differences in reported due to, e.g., weekends. Above zero is an increasing number of cases, below zero is a decreasing number of cases.
@@ -241,12 +201,7 @@ weekly_changes <-
     )
 
 weekly_changes %>%
-  ggplot(
-    aes(
-      x = date,
-      y = weekly_case_change
-    )
-  ) +
+  ggplot(aes(x = date, y = weekly_case_change)) +
     geom_line() +
     theme_void() +
     theme(strip.text = element_text(size = 4)) +
@@ -255,25 +210,22 @@ weekly_changes %>%
 
 Finally, this video shows the daily new cases for each UTLA through the whole pandemic.
 
-```{r animate_map, message = FALSE}
+```{r animate_map, message = FALSE, cache = TRUE}
 n_days <-
   covid_data %>%
   summarise(unique(date)) %>%
   nrow()
 animated <-
   weekly_changes %>%
-  left_join(utla_sf, ., by = c("ctyua17cd" = "areaCode")) %>%
+  right_join(utla_sf, by = c("ctyua17cd" = "areaCode")) %>%
   mutate(log_newCases = log(newCasesBySpecimenDate)) %>%
   ggplot() +
-    geom_sf(
-      aes(fill = log_newCases),
-      lwd = 0.2
-    ) +
-    geom_text(x = 0, y = 56, aes(label = date)) +
+    geom_sf(aes(fill = log_newCases), lwd = 0.2) +
+    geom_text(x = 50000, y = 50000, aes(label = date)) +
     theme_map() +
     scale_fill_viridis(discrete = FALSE) +
-    transition_manual(date, cumulative = FALSE)
-animate(animated, nframes = n_days, renderer = ffmpeg_renderer())
-# anim_save("map_animation.mp4", animated, nframes = n_days, renderer = ffmpeg_renderer())
-```
+    transition_manual(date, cumulative = FALSE) +
+    theme(legend.background = element_blank())
 
+animate(animated, nframes = n_days / 2, renderer = ffmpeg_renderer())
+```
